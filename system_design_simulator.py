@@ -204,15 +204,23 @@ def run_load_test(handler, num_requests: int, max_workers: int = 50) -> MetricsR
 
 """Temporary Banner"""
 def display_banner() -> None:
-    banner = """
-    ==========================================
-    System Design Scaling Simulator
-    A hands-on learning tool for Lead Engineer system design interviews
-    Simulates scaling from 100 to 1,000,000 users with real metrics.
-    Run: python3 system_design_simulator.py
-    ==========================================
-    """
-    print(banner)
+    print("\n" + "=" * 70)
+    print("   SYSTEM DESIGN SCALING SIMULATOR")
+    print("   Lead Engineer Interview Preparation Tool")
+    print("=" * 70)
+    print("\n   Scaling Journey: 100 users --> 1,000,000 users")
+    print("   Each stage shows: Theory --> Simulation --> Metrics --> Talking Points")
+    print("\n" + "-" * 70)
+    print("   STAGES:")
+    print("   [1] Single Server (100-1K users) + Back-of-Envelope Estimation")
+    print("   [2] Load Balancing (1K-5K users) + Stateless Design")
+    print("   [3] Caching Layer (5K-100K users) + CAP Theorem")
+    print("   [4] DB Replication & Sharding (100K-500K) + Consistency Models")
+    print("   [5] Async Processing & Rate Limiting (500K-1M) + Circuit Breakers")
+    print("   [6] Full Journey (all stages sequentially)")
+    print("   [T] Theory Reference (all concepts)")
+    print("   [Q] Quit")
+    print("-" * 70)
 
 def display_metrics(metrics: MetricsResult, label: str = "") -> None:
     print(f"\n   {'--- ' + label + ' ---' if label else '--- Metrics ---'}")
@@ -268,6 +276,67 @@ The if __name__ == "__main__" block at the bottom runs
 You will replace this with the full interactive menu at the end of this step
 ."""
 
+# IN this function we are going to display the first stage of the simulator which is the single server stage. We will display the architecture of the single server and also display some theory about back-of-envelope estimation and horizontal vs vertical scaling.
+def stage_single_server() -> None:
+    print_section("STAGE 1: Single Server (0 - 1,000 Users)")
+    display_architecture(1)
+    print_theory("Back-of-Envelope Estimation (DO THIS FIRST IN EVERY INTERVIEW)", """
+WHAT: Quick math to estimate system requirements before designing.
+WHEN: The FIRST thing after the interviewer states the problem.
+WHY:  Determines which scaling patterns you actually need.
+HOW:  QPS = DAU x requests/user / 86,400. Peak = QPS x 2-3.
+      Storage = Users x data/user x retention.
+      Bandwidth = QPS x avg response size.
+      Powers of two: 1KB=1000B, 1MB=1M B, 1GB=1B B, 1TB=1T B.
+    """)
+    print_theory("Horizontal vs Vertical Scaling", """
+Vertical (Scale Up): bigger machine. Horizontal (Scale Out): more machines.
+Vertical FIRST until ceiling. Horizontal requires stateless design.
+AWS: EC2 instance types (vertical), Auto Scaling Groups (horizontal).
+GCP: Compute Engine machine types (vertical), Managed Instance Groups.
+    """)
+
+    print("\n  [SIMULATION] Running load test: Single server under pressure...")
+    server = SimulatedServer("single-server", max_concurrent=10, base_latency_ms=20)
+    # Test with 100 concurrent users
+    print("\n  Test 1: 100 concurrent users...")
+    metrics_100 = run_load_test(server.handle_request, num_requests=100, max_workers=20)
+    display_metrics(metrics_100, "100 Users - Comfortable")
+    # Test with 500 concurrent users
+    print("\n  Test 2: 500 concurrent users (pushing limits)...")
+    metrics_500 = run_load_test(server.handle_request, num_requests=500, max_workers=50)
+    display_metrics(metrics_500, "500 Users - Under Pressure")
+    # Test with 1000 concurrent users
+    print("\n  Test 3: 1000 concurrent users (server overwhelmed)...")
+    metrics_1000 = run_load_test(server.handle_request, num_requests=1000, max_workers=100)
+    display_metrics(metrics_1000, "1000 Users - OVERWHELMED")
+    # Lead Engineer interview tips for this stage
+    print_lead_engineer("""
+At 1K users: single server is fine. Do NOT add K8s or microservices.
+Transition trigger: p99 > SLA or CPU > 70% sustained.
+Failure modes: SPOF, no graceful degradation.
+Cost: t3.medium $30/month handles 1K users easily.
+    """)
+
+    """
+    What does this simulation do?
+    This simulation demonstrates the behavior of a single server under different load conditions.
+    A SimulatedServer with max_concurrent=10 uses a threading Semaphore to limit parallel processing. Requests beyond capacity queue up or time out.
+    run_load_test() fires all requests concurrently using ThreadPoolExecutor. At 100 users, most requests get through smoothly. At 1,000, the server is overwhelmed and latency spikes.
+    The print_lead_engineer() block gives you the exact phrasing to use in an interview: what not to build at this scale, the transition trigger, and cost reasoning.
+    """
+
+
+    """
+    💡 Why does this matter for interviews?
+
+    You just watched a server break under load. This is the experience that makes scaling patterns intuitive rather than memorized. In an interview, you can say: "A single server with 10 concurrent connections is fine for 100 users, but at 1,000 the p99 exceeds any reasonable SLA. That is my trigger to scale horizontally."
+    🙋‍♀️ Simulation takes too long or hangs?
+    The 1,000-user test may take 10-20 seconds because requests queue behind the 10-connection limit. This is expected. If it hangs beyond 30 seconds, press Ctrl+C and check that max_workers=100 is set in the third run_load_test() call.
+    If you see a NameError for SimulatedServer or run_load_test, confirm that the class and function from Step 1 are still intact above your new code.
+    """
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -279,7 +348,7 @@ def main() -> None:
         choice = input("\n  Select stage [1-6, T, Q]: ").strip().upper()
 
         if choice == "1":
-            pass
+            stage_single_server()
         elif choice == "2":
             pass
         elif choice == "3":
