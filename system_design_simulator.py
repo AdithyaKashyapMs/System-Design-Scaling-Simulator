@@ -163,6 +163,220 @@ class SimulatedServer:
             """
 
 
+"""
+    Add Load Balancing and Caching
+
+    In the previous step, your single server collapsed under 1,000 concurrent users.
+    Latency spiked and errors appeared. The fix is horizontal scaling:
+    spread traffic across multiple servers using a load balancer.
+    But even with multiple servers, the database becomes the next bottleneck. 
+    Every request still hits the same data store. A cache layer absorbs repeated reads and 
+    drops latency dramatically. In this step, you will build both patterns and watch real metrics improve."""
+
+"""A load balancer sits between users and your servers.
+    It decides which server handles each incoming request.
+    You will implement two common algorithms: round-robin 
+    (each server takes turns) and least-connections 
+    (pick the server with the least active work)."""
+class LoadBalancer:
+    def __init__(self, servers: list[SimulatedServer], algorithm: str = "round_robin"):
+        self.servers = servers # this line of code initializes the LoadBalancer class with a list of SimulatedServer instances and a load balancing algorithm. The servers parameter is a list of SimulatedServer objects that the load balancer will distribute incoming requests to. The algorithm parameter specifies the load balancing strategy to use, with "round_robin" as the default option. The available algorithms can be extended in the future to include other strategies like least-connections or weighted round-robin.
+        self.algorithm = algorithm # this explanatin of this code is that it sets the load balancing algorithm to be used by the LoadBalancer instance. The algorithm parameter is a string that specifies which load balancing strategy to use when distributing incoming requests to the available servers. In this case, the default value is "round_robin", but it can be changed to other strategies as needed. The chosen algorithm will determine how the load balancer selects which server should handle each incoming request.
+        self._rr_index = 0 # this line of code initializes an internal variable _rr_index to 0. This variable is used to keep track of the current index in the list of servers when using the round-robin load balancing algorithm. Each time a request is handled, the _rr_index will be incremented to point to the next server in the list, ensuring that requests are distributed evenly across all available servers. When the end of the list is reached, the index will wrap around to the beginning, allowing for continuous cycling through the servers.
+        self._lock = threading.Lock() # here we are creating a threading lock to ensure that access to shared resources (like the _rr_index) is thread-safe. Since multiple threads may be handling requests concurrently, we need to prevent race conditions and ensure that only one thread can modify the _rr_index at a time. The lock will be acquired before accessing or modifying the _rr_index and released afterward, ensuring that the round-robin index is updated correctly and consistently across all threads.
+
+    """💡 What does this code do?
+
+    The LoadBalancer accepts a list of servers and an algorithm choice.
+    It uses a threading lock so multiple threads can safely request a server at the same time.
+    Round-robin cycles through servers in order using _rr_index modulo the number of servers.
+    Least-connections picks the server with the lowest _current_load value, 
+    sending new requests to whichever server is least busy."""
+    def get_server(self) -> SimulatedServer:
+        with self._lock:
+            if self.algorithm == "round_robin":
+                server = self.servers[self._rr_index % len(self.servers)] # this line of code selects the next server in the list based on the current _rr_index value. The modulo operator (%) is used to wrap around the index when it reaches the end of the list, ensuring that the selection continues in a circular manner. This allows for even distribution of requests across all available servers in a round-robin fashion.
+                self._rr_index += 1 # this line of code increments the _rr_index by
+                return server # this line of code returns the selected server to handle the incoming request. The server is chosen based on the round-robin algorithm, which ensures that requests are distributed evenly across all available servers in a cyclic manner.
+            else:
+                return min(self.servers, key=lambda s: s._current_load) # this line of code selects the server with the least number of active requests (i.e., the least load) when the load balancing algorithm is set to "least_connections". The min function is used to find the server with the minimum _current_load value among all available servers. The key parameter specifies a lambda function that retrieves the _current_load attribute of each server, allowing the min function to compare and identify the server with the lowest load. This approach helps to distribute incoming requests more efficiently by directing them to servers that are currently handling fewer requests, potentially improving overall performance and reducing latency.
+
+"""Add the LRU cache and its stage function
+    Load balancing solved the server CPU bottleneck. But all 3 servers still
+    hit the same database for every request. A cache stores frequently accessed data in
+    memory so repeat reads skip the database entirely.
+    Below the LoadBalancer class, add the first part of the LRUCache class with its constructor and get() method:"""
+
+class LRUCache:
+    def __init__(self, max_size: int = 1000, ttl_seconds: float = 60.0):
+        self.max_size = max_size # this line of code initializes the maximum size of the cache, which determines how many items can be stored in the cache at any given time. If the number of items exceeds this limit, the least recently used (LRU) item will be evicted to make room for new items.
+        self.ttl_seconds = ttl_seconds # this line of code initializes the time-to-live (TTL) for each cache entry, which specifies how long an item can remain in the cache before it is considered expired and eligible for eviction. The TTL is measured in seconds, and once an item exceeds this duration, it will be removed from the cache during the next access or cleanup operation.
+        self._cache: OrderedDict = OrderedDict() # this line of code initializes an OrderedDict to store the cached items. An OrderedDict maintains the order of insertion, which allows us to easily track the least recently used items. When an item is accessed or added to the cache, it will be moved to the end of the OrderedDict, indicating that it was recently used. This behavior is essential for implementing the LRU eviction policy.
+        self._timestamps: dict = {} # this line of code initializes a regular dictionary to store the timestamps of when each cache entry was last accessed or added. The timestamps are used to determine whether a cache entry has expired based on the specified TTL (time-to-live). When an item is accessed or added to the cache, its corresponding timestamp will be updated to the current time. During cache access or cleanup operations, the timestamps will be checked to identify and remove any expired entries from the cache.
+        self._lock = threading.Lock() # this line of code creates a threading lock to ensure that access to the cache is thread-safe. Since multiple threads may be accessing or modifying the cache concurrently, we need to prevent race conditions and ensure that only one thread can perform operations on the cache at a time. The lock will be acquired before accessing or modifying the cache and released afterward, ensuring that all operations are performed safely and consistently across threads.
+        self.hits = 0 # this line of code initializes a counter to track the number of cache hits, which occurs when a requested item is found in the cache and returned without needing to fetch it from the underlying data source. The hits counter can be used to calculate the cache hit rate, which is an important metric for evaluating the effectiveness of the cache in improving performance and reducing latency.
+        self.misses = 0 # this line of code initializes a counter to track the number of cache misses, which occurs when a requested item is not found in the cache and must be fetched from the underlying data source. The misses counter can be used to calculate the cache miss rate, which is an important metric for evaluating the effectiveness of the cache in improving performance and reducing latency. A high miss rate may indicate that the cache size or eviction policy needs to be adjusted to better accommodate the workload.
+
+
+    """💡 What does the get() method do?
+        When you look up a key, the cache checks two things:
+        does the key exist,
+        and has it expired (TTL). If the key is fresh, it moves to the end of the 
+        ordered dict (marking it as recently used) and increments hits.
+        If the key is missing or expired, the method increments misses and returns None. 
+        Expired entries are cleaned up immediately on access."""
+    def get(self, key: str) -> Optional[str]:
+        with self._lock:
+            if key in self._cache:
+                if time.time() - self._timestamps[key] > self.ttl_seconds:
+                    # Entry expired
+                    del self._cache[key]
+                    del self._timestamps[key]
+                    self.misses += 1
+                    return None
+                # Move to end to mark as recently used
+                self._cache.move_to_end(key)
+                self.hits += 1
+                return self._cache[key]
+            self.misses += 1
+            return None
+
+
+    """💡 What do put() and hit_rate do?
+        put() stores a key-value pair. If the cache is full, 
+        it evicts the least recently used item using popitem(last=False) which removes 
+        the oldest entry from the ordered dict.
+
+        hit_rate is a property that calculates the percentage of lookups 
+        that found data in the cache vs going to the database. 
+        A 90% hit rate means 90% of reads skip the database."""    
+    def put(self, key: str, value: str) -> None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key) # Move to end to mark as recently used
+            else:
+                if len(self._cache) >= self.max_size:
+                    oldest_key, _ = self._cache.popitem(last=False)
+                    del self._timestamps[oldest_key]
+                self._cache[key] = value
+                self._timestamps[key] = time.time()
+
+    @property
+    # This property calculates the cache hit rate as a float between 0.0 and 1.0, representing the proportion of successful cache hits to total cache accesses (hits + misses). If there are no accesses, it returns 0.0 to avoid division by zero.
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
+
+"""
+Implement Database Replicationa and Sharding
+Your caching layer brought read latency down dramatically, 
+but there is still a fundamental bottleneck lurking underneath.
+
+Write-heavy workloads still funnel through a single database. 
+Read replicas distribute read traffic, but when writes overwhelm the primary, 
+sharding becomes the nuclear option. In this step, you will build both patterns 
+and see exactly how consistent hashing prevents catastrophic key redistribution when you add or remove nodes.
+
+Add the ConsistentHashRing class
+Naive modulo-based sharding (key % N) breaks when you add or remove a server. 
+Almost every key gets remapped. Consistent hashing solves this by placing nodes 
+on a virtual ring so only a fraction of keys move.
+"""
+
+class ConsistentHashRing:
+    def __init__(self, nodes: list[str], virtual_nodes: int = 150):
+        self.virtual_nodes = virtual_nodes  # Number of virtual nodes per physical node
+        self.ring: dict[int, str] = {}  # Maps hash values to node identifiers
+        self.sorted_hashes: list[int] = []  # Sorted list of hash values for efficient lookup
+        self._key_distribution: dict[str, int] = {}  # Tracks how many keys are assigned to each node
+        for node in nodes:
+            self.add_node(node)
+
+    def _hash(self, key: str) -> int:
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)  # Use MD5 hash for consistent hashing
+
+    """💡 How does _hash work?
+    It takes a string key and generates a consistent hash value using MD5. This ensures that the same key always produces the same hash, which is essential for consistent hashing."""
+    def add_node(self, node: str) -> None: # Adds a new node to the consistent hash ring by creating virtual nodes and updating the ring and sorted hash list. It also initializes the key distribution for the new node.
+        self._key_distribution[node] = 0
+        for i in range(self.virtual_nodes):
+            virtual_key = f"{node}:v{i}"
+            hash_val = self._hash(virtual_key)
+            self.ring[hash_val] = node
+        self.sorted_keys = sorted(self.ring.keys())
+
+    def remove_node(self, node: str) -> None: # Removes a node from the consistent hash ring by deleting its virtual nodes from the ring and updating the sorted hash list. It also removes the key distribution entry for the removed node.
+        for i in range(self.virtual_nodes):
+            virtual_key = f"{node}:v{i}"
+            hash_val = self._hash(virtual_key)
+            if hash_val in self.ring:
+                del self.ring[hash_val]
+        self.sorted_keys = sorted(self.ring.keys())
+        if node in self._key_distribution:
+            del self._key_distribution[node]
+
+    """💡 What does this code do?
+
+Each physical node gets 150 virtual positions on the ring. This ensures even key distribution even with a small number of physical nodes.
+_hash() converts any string into a large integer using MD5. This positions keys and nodes on the same ring.
+add_node() creates 150 virtual entries per node. More virtual nodes means smoother distribution.
+remove_node() deletes all virtual entries for a node. Only keys that belonged to that node need remapping."""
+
+
+    """💡 How does get_node work?
+    It hashes the key, then walks clockwise around the ring (through sorted keys) until it 
+    finds the first node position that is greater than or equal to the key's hash. If no 
+    such position exists (the key hashes past the last node), it wraps around to the first node on the ring."""
+    def get_node(self, key: str) -> str:
+        if not self.ring:
+            raise ValueError("Hash ring is empty")
+        hash_val = self._hash(key)
+        for ring_key in self.sorted_keys:
+            if hash_val <= ring_key:
+                node = self.ring[ring_key]
+                self._key_distribution[node] = self._key_distribution.get(node, 0) + 1
+                return node
+        node = self.ring[self.sorted_keys[0]]
+        self._key_distribution[node] = self._key_distribution.get(node, 0) + 1
+        return node
+
+    def get_distribution(self) -> dict[str, int]: # Returns a dictionary representing the distribution of keys across nodes, where the keys are node identifiers and the values are the number of keys assigned to each node. This allows for monitoring and analyzing how evenly the keys are distributed among the nodes in the consistent hash ring.
+        return dict(self._key_distribution)
+
+
+"""
+Add the ReplicatedDatabase class
+A replicated database separates reads from writes. The primary handles all writes, 
+while read replicas absorb the 70%+ of traffic that is read-only.
+"""
+
+class ReplicatedDatabase:
+    def __init__(self, num_replicas: int = 2):
+        self.primary = SimulatedServer("primary-db", max_concurrent=20, base_latency_ms=30.0)
+        self.replicas = [
+            SimulatedServer(f"replica-{i}", max_concurrent=20, base_latency_ms=25.0)
+            for i in range(num_replicas)
+        ]
+        self._read_index = 0
+        self._lock = threading.Lock()
+
+    def write(self, timeout: float = 5.0) -> RequestResult:
+        return self.primary.handle_request(timeout)
+
+    def read(self, timeout: float = 5.0) -> RequestResult:
+        with self._lock:
+            replica = self.replicas[self._read_index % len(self.replicas)]
+            self._read_index += 1
+        return replica.handle_request(timeout)
+
+    """💡 What does this code do?
+    The primary server has a slightly higher base latency (30ms) than replicas (25ms) because it also handles replication overhead in a real system.
+    read() round-robins across replicas using a lock-protected index. This distributes read load evenly.
+    write() always routes to the primary. In a real system, writes propagate to replicas asynchronously."""
+
+
+
+
 # =============================================================================
 # LOAD TEST RUNNER
 # =============================================================================
@@ -336,6 +550,117 @@ Cost: t3.medium $30/month handles 1K users easily.
     If you see a NameError for SimulatedServer or run_load_test, confirm that the class and function from Step 1 are still intact above your new code.
     """
 
+def stage_load_balancing() -> None:
+    print_section("STAGE 2: Load Balancing (1,000 - 5,000 Users)")
+    display_architecture(2)
+    print_theory("Load Balancing", "Round-robin, least-connections, IP-hash, weighted. L4 vs L7.")
+    print_theory("The Stateless Server Rule", "No session state on server. Move to Redis/S3.")
+    single = SimulatedServer("solo", max_concurrent=10, base_latency_ms=20)
+    metrics_single = run_load_test(single.handle_request, num_requests=1000, max_workers=50)
+    display_metrics(metrics_single, "1 Server, 1000 Requests")
+    servers = [SimulatedServer(f"app-{i}", max_concurrent=10, base_latency_ms=20) for i in range(3)]
+    lb = LoadBalancer(servers, algorithm="round_robin")
+    def lb_request():
+        return lb.get_server().handle_request()
+    metrics_lb = run_load_test(lb_request, num_requests=1000, max_workers=50)
+    display_metrics(metrics_lb, "3 Servers + Load Balancer, 1000 Requests")
+    improvement = ((metrics_single.p95_latency_ms - metrics_lb.p95_latency_ms) / metrics_single.p95_latency_ms * 100)
+    print(f"\n  >> P95 Latency Improvement: {improvement:.1f}%")
+    print(f"  >> Error Rate: {metrics_single.error_rate*100:.1f}% -> {metrics_lb.error_rate*100:.1f}%")
+    print_lead_engineer("Use ALB on AWS. Avoid sticky sessions. Stateless servers only.")
+
+
+"""
+    💡 What does the caching simulation demonstrate?
+
+    The function runs the same 500 requests twice. First without a cache (every request hits the slow server). 
+    Then with the LRUCache in front.
+
+    The cached_request() inner function checks the cache first. On a hit, 
+    it returns in under 2ms instead of the server's 40ms+ base latency. On a miss, 
+    it fetches from the server and stores the result for next time. The 20 popular keys 
+    simulate real access patterns where a small set of data is requested repeatedly
+"""
+def stage_caching() -> None:
+    print_section("STAGE 3: Caching Layer (5,000 - 100,000 Users)")
+    display_architecture(3)
+    print_theory("Caching Strategies", "Cache-aside, write-through, write-back, write-around. LRU/LFU/TTL eviction.")
+    print_theory("CAP Theorem", "C+A+P: choose CP or AP during partition. Redis=AP, ZooKeeper=CP.")
+    server = SimulatedServer("app", max_concurrent=20, base_latency_ms=40)
+    cache = LRUCache(max_size=200, ttl_seconds=30.0)
+    metrics_no_cache = run_load_test(server.handle_request, num_requests=500, max_workers=50)
+    display_metrics(metrics_no_cache, "No Cache - All DB Hits")
+    popular_keys = [f"item:{i}" for i in range(20)]
+    def cached_request():
+        key = random.choice(popular_keys)
+        cached = cache.get(key)
+        if cached:
+            return RequestResult(latency_ms=random.uniform(0.5, 2.0), success=True, from_cache=True)
+        result = server.handle_request()
+        if result.success:
+            cache.put(key, f"data_for_{key}")
+        return result
+    metrics_cached = run_load_test(cached_request, num_requests=500, max_workers=50)
+    display_metrics(metrics_cached, "With Cache")
+    print(f"\n  >> Cache Hit Rate: {cache.hit_rate * 100:.1f}%")
+    improvement = ((metrics_no_cache.p95_latency_ms - metrics_cached.p95_latency_ms) / metrics_no_cache.p95_latency_ms * 100)
+    print(f"  >> P95 Latency Improvement: {improvement:.1f}%")
+    print_lead_engineer("Redis cluster ~$200/month. 90% hit rate = 72% DB load reduction.")
+
+    """
+    💡 Why does CAP theorem appear in the caching stage?
+        The moment you add a distributed cache like Redis, you have data in two places 
+        (cache and database). During a network partition, you must choose: reject requests until the cache is consistent (CP), 
+        or serve potentially stale cached data to stay available (AP).
+        In interviews, the Lead Engineer answer is: "CAP is a spectrum, not a binary. 
+        I choose consistency per operation. User login = strong consistency. 
+        Like count = eventual consistency.
+    """
+
+def stage_database_scaling() -> None:
+    print_section("STAGE 4: DB Replication & Sharding (100K - 500K Users)")
+    display_architecture(4)
+    print_theory("Database Replication", "Leader-follower. Reads to replicas. Replication lag.")
+    print_theory("Database Sharding", "Range, hash, directory, geo. Consistent hashing.")
+    print_theory("Consistency Models", "Strong, eventual, causal, read-your-writes.")
+    single_db = SimulatedServer("single-db", max_concurrent=15, base_latency_ms=30)
+    display_metrics(run_load_test(single_db.handle_request, num_requests=500, max_workers=50), "Single DB")
+    rep_db = ReplicatedDatabase(num_replicas=2)
+    def replicated_request():
+        if random.random() < 0.7:
+            return rep_db.read()
+        return rep_db.write()
+    display_metrics(run_load_test(replicated_request, num_requests=500, max_workers=50), "Replicated DB")
+    ring = ConsistentHashRing(["shard-1", "shard-2", "shard-3", "shard-4"])
+    for i in range(10000):
+        ring.get_node(f"user:{i}")
+    dist = ring.get_distribution()
+    print("\n  Key distribution across 4 shards (10,000 keys):")
+    for shard, count in sorted(dist.items()):
+        bar = "#" * (count // 100)
+        print(f"    {shard}: {count:5d} keys  {bar}")
+    ring_new = ConsistentHashRing(["shard-1", "shard-2", "shard-3", "shard-4", "shard-5"])
+    moved = sum(1 for i in range(10000) if ring.get_node(f"user:{i}") != ring_new.get_node(f"user:{i}"))
+    print(f"  Keys redistributed: {moved}/10000 ({moved/100:.1f}%)")
+    print_lead_engineer("Exhaust caching and replicas before sharding.")
+
+"""What does this function do?
+
+It first prints theory for replication, sharding strategies, and consistency models.
+Then it runs 500 requests against a single database, followed by 500 requests against a replicated database with a 70/30 read/write split. You will see latency improve because reads go to faster replicas.
+Finally it creates a consistent hash ring with 4 shards, distributes 10,000 keys, then adds a 5th shard to show that far fewer than 50% of keys get redistributed.
+"""
+
+""" You should see the replication simulation show lower latency for the replicated DB compared to the single DB. 
+    Then the consistent hashing output shows 10,000 keys distributed roughly evenly across 4 shards, with less 
+    than 25% of keys redistributed when shard-5 is added.
+
+    💡 Why is less than 25% redistribution significant?
+    With naive modulo hashing, adding a 5th node to 4 nodes would remap roughly 80% of all keys. 
+    Consistent hashing keeps it close to the ideal 20% (K/N, where K is total keys and N is new node count). 
+    This means adding capacity does not require a massive data migration.
+
+"""
 
 # =============================================================================
 # MAIN
@@ -350,11 +675,11 @@ def main() -> None:
         if choice == "1":
             stage_single_server()
         elif choice == "2":
-            pass
+            stage_load_balancing()
         elif choice == "3":
-            pass
+            stage_caching()
         elif choice == "4":
-            pass
+            stage_database_scaling()
         elif choice == "5":
             pass
         elif choice == "6":
