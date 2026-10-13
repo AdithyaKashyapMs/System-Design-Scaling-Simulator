@@ -375,7 +375,159 @@ class ReplicatedDatabase:
     write() always routes to the primary. In a real system, writes propagate to replicas asynchronously."""
 
 
+# =============================================================================
+# MESSAGE QUEUE
+# =============================================================================
 
+class MessageQueue:
+    """Simulates an async message queue with workers."""
+
+    def __init__(self, num_workers: int = 3, processing_time_ms: float = 50.0):
+        self._queue = queue.Queue = queue.Queue(maxsize=1000)  # Initialize a queue with a maximum size of 1000 to hold messages waiting to be processed.
+        self._results: list[RequestResult] = []  # Initialize a list to store the results of processed messages, which will be used for metrics collection and analysis.
+        self._lock = threading.Lock()  # Create a threading lock to ensure thread-safe access to shared resources, such as the results list, when multiple worker threads are processing messages concurrently.
+        self._workers_running = False # Initialize a flag to indicate whether the worker threads are currently running. This flag will be used to control the start and stop of worker threads.
+        self.num_workers = num_workers  # Store the number of worker threads that will be created to process messages from the queue.
+        self.processing_time_ms = processing_time_ms  # Store the simulated processing time in milliseconds for
+        self.enqueued = 0  # Initialize a counter to track the number of messages that have been enqueued for processing. This will be used to calculate metrics such as throughput and error rates.
+        self.processed = 0 # Initialize a counter to track the number of messages that have been successfully processed by the worker threads. This will be used to calculate metrics such as throughput and error rates.
+        self.dropped = 0 # Initialize a counter to track the number of messages that have been dropped due to the queue being full. This will be used to calculate metrics such as error rates and to monitor the performance of the message queue under load.
+
+    def enqueue(self, message: str) -> bool:
+        try:
+            self._queue.put_nowait(message)  # Attempt to add the message to the queue without blocking. If the queue is full, a queue.Full exception will be raised.
+            self.enqueued += 1  # Increment the enqueued counter to track the number of messages successfully added to the queue.
+            return True  # Return True to indicate that the message was successfully enqueued.
+        except queue.Full:
+            self.dropped += 1  # Increment the dropped counter to track the number of messages that could not be enqueued due to the queue being full.
+            return False  # Return False to indicate that the message was not enqueued due to the queue being full.
+
+    """💡 What does this code do?
+    The queue has a max capacity of 10,000 messages. If you try to push beyond that, the message is dropped and the dropped counter increments. 
+    This simulates backpressure in real systems like Kafka or SQS.
+    The put_nowait() call is non-blocking. It either succeeds instantly or raises queue.Full. This lets the producer continue without waiting."""
+
+    def _worker(self) -> None: # This method defines the behavior of a worker thread that processes messages from the queue. It runs in a loop, checking for new messages to process while the _workers_running flag is set to True. When a message is retrieved from the queue, it simulates processing by sleeping for the specified processing time, then records the result of the processing in a thread-safe manner.
+        while self._workers_running:  # Continue running as long as the _workers_running flag is True.
+            try:
+                msg = self._queue.get(timeout=0.1) # Attempt to retrieve a message from the queue with a timeout of 0.1 seconds. If no message is available, a queue.Empty exception will be raised.
+                jitter = random.uniform(0.5, 1.5)  # Generate a random jitter value between 0.5 and 1.5 to simulate variability in processing time.
+                latency = self.processing_time_ms * jitter  # Calculate the simulated processing latency by multiplying the base processing time by the jitter value.
+                time.sleep(latency / 1000.0)  # Sleep for the calculated latency in seconds
+                with self._lock:
+                    self._results.append(RequestResult(latency_ms=latency, success=True))  # Append a successful RequestResult to the results list, indicating that the message was processed successfully.
+                    self.processed += 1  # Increment the processed counter to track the number of messages that have been successfully processed.
+                self._queue.task_done()  # Mark the retrieved message as processed, allowing the queue to track the number of unfinished tasks.
+            except queue.Empty:
+                continue  # If the queue is empty, continue the loop and check for new messages again.
+
+    def start_workers(self) -> None:
+        self._workers_running = True
+        self._worker_threads = []
+        for i in range(self.num_workers):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._worker_threads.append(t)
+
+    def stop_workers(self) -> None:
+        self._workers_running = False
+        for t in self._worker_threads:
+            t.join(timeout=2.0)
+
+    @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
+
+"""Add rate limiting and circuit breaker classes
+A rate limiter controls how many requests a client can make per second. 
+A circuit breaker stops calls to a failing dependency so it can recover instead of dragging your entire system down.
+"""
+# =============================================================================
+# RATE LIMITER (Token Bucket)
+# =============================================================================
+
+
+"""💡 What does this code do?
+The token bucket algorithm works like a bucket that refills at a steady rate. Each request costs one token. 
+If the bucket is empty, the request is rejected. This allows short bursts (up to the bucket capacity) while enforcing a long-term rate limit.
+AWS API Gateway and Cloudflare use token bucket internally. It is the most common rate limiting algorithm in production systems."""
+class TokenBucketRateLimiter:
+    """Token bucket rate limiter."""
+
+    def __init__(self, rate: float, capacity: int):
+        self.rate = rate  # tokens per second
+        self.capacity = capacity
+        self.tokens = capacity
+        self._last_refill = time.time()
+        self._lock = threading.Lock()
+        self.allowed = 0
+        self.rejected = 0
+
+    def allow_request(self) -> bool:
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_refill
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self._last_refill = now
+
+            if self.tokens >= 1:
+                self.tokens -= 1
+                self.allowed += 1
+                return True
+            self.rejected += 1
+            return False
+    
+# =============================================================================
+# CIRCUIT BREAKER
+# =============================================================================
+
+class CircuitBreaker:
+    """Circuit breaker with closed/open/half-open states."""
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 3.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.state = "closed"
+        self._failure_count = 0
+        self._last_failure_time = 0.0
+        self._lock = threading.Lock()
+        self.trips = 0
+
+    def call(self, func, *args, **kwargs) -> RequestResult:
+        with self._lock:
+            if self.state == "open":
+                if time.time() - self._last_failure_time > self.recovery_timeout:
+                    self.state = "half_open"
+                else:
+                    return RequestResult(latency_ms=1.0, success=False)
+        try:
+            result = func(*args, **kwargs)
+            if result.success:
+                with self._lock:
+                    self._failure_count = 0
+                    if self.state == "half_open":
+                        self.state = "closed"
+            else:
+                self._record_failure()
+            return result
+        except Exception:
+            self._record_failure()
+            return RequestResult(latency_ms=0, success=False)
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._failure_count >= self.failure_threshold:
+                self.state = "open"
+                self.trips += 1
+
+    """💡 How does the circuit breaker work?
+
+        Closed (normal): requests pass through. If failures hit the threshold (5), the circuit trips open.
+        Open (tripped): all requests are rejected instantly (1ms latency, no actual call). This protects the failing service from further load.
+        Half-open (testing): after the recovery timeout, one request is allowed through. If it succeeds, the circuit closes. If it fails, it opens again."""
 
 # =============================================================================
 # LOAD TEST RUNNER
@@ -663,6 +815,155 @@ Finally it creates a consistent hash ring with 4 shards, distributes 10,000 keys
 """
 
 # =============================================================================
+# STAGE 5: ASYNC PROCESSING & RATE LIMITING
+# =============================================================================
+
+def stage_async_and_protection() -> None:
+    print_section("STAGE 5: Async Processing & Rate Limiting (500K - 1M Users)")
+    display_architecture(5)
+    print_theory("Message Queues & Event-Driven Architecture", "Decouple producers from consumers. Absorb spikes. DLQ for failures.")
+    print_theory("Rate Limiting & Circuit Breakers", "Token bucket, sliding window. CB states: closed/open/half-open.")
+    print("\n  [SIMULATION] Message queue absorbing traffic spike...")
+    mq = MessageQueue(num_workers=3, processing_time_ms=30)
+    mq.start_workers()
+    print("\n  Sending 500 messages in a burst (simulating viral traffic)...")
+    burst_start = time.perf_counter()
+    for i in range(500):
+        mq.enqueue(f"task-{i}")
+    burst_duration = time.perf_counter() - burst_start
+    print(f"  Enqueue time: {burst_duration*1000:.1f}ms (burst absorbed instantly)")
+    print(f"  Queue depth after burst: {mq.queue_depth}")
+    print("  Waiting for workers to process...")
+    time.sleep(3)
+    print(f"  Processed: {mq.processed}/500")
+    print(f"  Dropped: {mq.dropped}")
+    mq.stop_workers()
+
+    print("\n  [SIMULATION] Rate limiting (100 req/s limit)...")
+    limiter = TokenBucketRateLimiter(rate=100, capacity=100)
+    allowed = 0
+    rejected = 0
+    for _ in range(300):
+        if limiter.allow_request():
+            allowed += 1
+        else:
+            rejected += 1
+    print(f"  300 requests sent instantly:")
+    print(f"    Allowed: {allowed}")
+    print(f"    Rejected: {rejected}")
+    print("\n  [SIMULATION] Circuit breaker protecting from failing service...")
+    def failing_service() -> RequestResult:
+        if random.random() < 0.8:
+            return RequestResult(latency_ms=200, success=False)
+        return RequestResult(latency_ms=50, success=True)
+    cb = CircuitBreaker(failure_threshold=5, recovery_timeout=1.0)
+    for i in range(20):
+        result = cb.call(failing_service)
+        if i % 5 == 0:
+            print(f"    Request {i:2d}: state={cb.state:10s} success={result.success}")
+    print(f"  Circuit breaker tripped {cb.trips} time(s)")
+    print_theory("Remaining Lead Engineer Concepts", "CDN, Observability (RED/SLIs/SLOs), API Design (REST/gRPC/GraphQL), Security (Zero Trust/mTLS), AI/ML Infrastructure.")
+    print_lead_engineer("At 1M users: CDN + API Gateway + LB + Cache + Queue + Circuit Breakers + Observability.")
+
+    """ What does this code do?
+    The rate limiter starts with 100 tokens. 300 requests fire instantly. The first ~100 succeed (they drain the bucket), and the rest are rejected because tokens refill at 100/second but all 300 arrive in the same instant.
+    The circuit breaker calls a service with an 80% failure rate. After 5 failures, it trips open and fast-rejects all subsequent requests (1ms latency instead of waiting 200ms for a guaranteed failure)."""
+
+# =============================================================================
+# FULL JOURNEY
+# =============================================================================
+
+def run_full_journey() -> None:
+    print_section("FULL SCALING JOURNEY: 100 -> 1,000,000 Users")
+    results = []
+    print("\n  [Stage 1] Single server, 200 requests...")
+    server = SimulatedServer("solo", max_concurrent=10, base_latency_ms=20)
+    m = run_load_test(server.handle_request, num_requests=200, max_workers=30)
+    results.append(("Single Server (200 users)", m))
+    print("  [Stage 2] Load balanced (3 servers), 500 requests...")
+    servers = [SimulatedServer(f"app-{i}", max_concurrent=10, base_latency_ms=20) for i in range(3)]
+    lb = LoadBalancer(servers)
+    m = run_load_test(lambda: lb.get_server().handle_request(), num_requests=500, max_workers=50)
+    results.append(("Load Balanced (500 users)", m))
+    print("  [Stage 3] Cached, 800 requests...")
+    cache = LRUCache(max_size=100, ttl_seconds=30)
+    popular = [f"item:{i}" for i in range(15)]
+    def cached_req():
+        key = random.choice(popular)
+        if cache.get(key):
+            return RequestResult(latency_ms=random.uniform(1, 3), success=True, from_cache=True)
+        result = lb.get_server().handle_request()
+        if result.success:
+            cache.put(key, "data")
+        return result
+    m = run_load_test(cached_req, num_requests=800, max_workers=50)
+    results.append(("+ Cache Layer (800 users)", m))
+    print("  [Stage 4] Replicated DB, 1000 requests...")
+    rep_db = ReplicatedDatabase(num_replicas=3)
+    def rep_req():
+        key = random.choice(popular)
+        if cache.get(key):
+            return RequestResult(latency_ms=random.uniform(1, 3), success=True, from_cache=True)
+        if random.random() < 0.7:
+            result = rep_db.read()
+        else:
+            result = rep_db.write()
+        if result.success:
+            cache.put(key, "data")
+        return result
+    m = run_load_test(rep_req, num_requests=1000, max_workers=80)
+    results.append(("+ DB Replicas (1000 users)", m))
+    print("  [Stage 5] Full stack + rate limiting, 1500 requests...")
+    rl = TokenBucketRateLimiter(rate=500, capacity=500)
+    def full_stack_req():
+        if not rl.allow_request():
+            return RequestResult(latency_ms=1, success=False)
+        return rep_req()
+    m = run_load_test(full_stack_req, num_requests=1500, max_workers=100)
+    results.append(("+ Rate Limiting (1500 users)", m))
+
+    print("\n" + "=" * 70)
+    print("  SCALING JOURNEY SUMMARY")
+    print("=" * 70)
+    print(f"  {'Stage':<32} {'p50':>6} {'p95':>6} {'p99':>6} {'RPS':>7} {'Err%':>5}")
+    print(f"  {'-'*32} {'-'*6} {'-'*6} {'-'*6} {'-'*7} {'-'*5}")
+    for label, m in results:
+        print(f"  {label:<32} {m.p50_latency_ms:>5.0f}ms {m.p95_latency_ms:>5.0f}ms {m.p99_latency_ms:>5.0f}ms {m.throughput_rps:>6.0f} {m.error_rate*100:>4.1f}%")
+    print("\n  Key insight: Each layer addresses a specific bottleneck.")
+
+    """💡 What does the full journey show?
+    The comparison table reveals how each scaling pattern improves specific metrics. 
+    Load balancing reduces latency through distribution. Caching slashes p95 by serving from RAM. 
+    Replicas handle more reads. Rate limiting introduces controlled errors (rejected requests) 
+    to protect the system from total collapse."""
+
+# =============================================================================
+# THEORY REFERENCE
+# =============================================================================
+
+def theory_reference() -> None:
+    print_section("THEORY REFERENCE: All Concepts At A Glance")
+    print("""
+  SCALING JOURNEY DECISION TREE:
+  Users      | Bottleneck         | Solution            | Stage
+  0-1K       | None               | Single server       | 1
+  1K-5K      | Server CPU/memory  | Load balancer       | 2
+  5K-100K    | Database reads     | Cache (Redis)       | 3
+  100K-500K  | DB reads + writes  | Replicas + Sharding | 4
+  500K-1M    | Spikes + failures  | Queues + Protection | 5
+
+  INTERVIEW FRAMEWORK (45 minutes):
+  [0:00-0:05] Clarify requirements + back-of-envelope estimation
+  [0:05-0:08] Define API and data model
+  [0:08-0:25] High-level design
+  [0:25-0:40] Deep dive (1-2 components)
+  [0:40-0:45] Scaling, failure modes, monitoring, cost
+    """)
+
+
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -681,19 +982,16 @@ def main() -> None:
         elif choice == "4":
             stage_database_scaling()
         elif choice == "5":
-            pass
+            stage_async_and_protection()
         elif choice == "6":
-            pass
+            run_full_journey()
         elif choice == "T":
-            pass
+            theory_reference()
         elif choice == "Q":
-            print("\n  Good luck in your interview!\n")
+            print("\n  Good luck in your interview! You've got this.")
+            print("  Remember: Drive the discussion. Mention trade-offs unprompted.")
+            print("  State what you would NOT build. Mention cost and failure modes.\n")
             break
-        else:
-            print("  Invalid choice. Enter 1-6, T, or Q.")
-
-        input("\n  Press Enter to return to menu...")
-        display_banner()
 
 
 if __name__ == "__main__":
